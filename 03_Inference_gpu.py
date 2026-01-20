@@ -109,10 +109,10 @@ def normalizer(_audio, target_value=8192.0):
     np.clip(_audio, -32768.0, 32767.0, out=_audio)
     return _audio.astype(np.int16)
 
-def decode_with_pure_embeddings_gpu(llm_obj, audio_embeddings, max_new_tokens=200):
+def decode_with_pure_embeddings_gpu(llm, audio_embeddings, max_new_tokens=200):
     """
     纯 Embedding 解码函数 (GPU 版本)
-    使用分块注入策略避免 Vulkan 后端的 NaN 问题
+    完全复制自 06 的优化版本
     """
 
     # 1. 准备数据
@@ -132,17 +132,15 @@ def decode_with_pure_embeddings_gpu(llm_obj, audio_embeddings, max_new_tokens=20
 
     batch_text = llama_batch_init(1, 0, 1)
 
-    ctx = llm_obj.ctx
-
-    # 3. 清理上下文缓存
-    llama_kv_self_clear(llm_obj.ctx)
-    llm_obj.n_tokens = 0
+    ctx = llm.ctx
+    llama_kv_self_clear(ctx)
+    llm.n_tokens = 0
 
     try:
         # ---------------------------------------------------------------------
         # 阶段 A: 分块注入融合 Embedding (GPU 优化)
         # ---------------------------------------------------------------------
-        logger.info(f"正在注入融合 Embedding (Chunk Size: {CHUNK_SIZE})...")
+        print(f"\n[*] Start Injection (Chunk Size: {CHUNK_SIZE})...")
         inject_start = time.time()
 
         for i in range(0, n_tokens, CHUNK_SIZE):
@@ -169,9 +167,10 @@ def decode_with_pure_embeddings_gpu(llm_obj, audio_embeddings, max_new_tokens=20
 
             # 解码
             if llama_decode(ctx, batch_embd) != 0:
-                raise RuntimeError(f"Audio embedding decoding failed at index {i}")
+                print(f"[!] Error during injection at index {i}")
+                return ""
 
-            llm_obj.n_tokens += current_len
+            llm.n_tokens += current_len
 
             # 简易进度条
             if i % 32 == 0:
@@ -179,67 +178,60 @@ def decode_with_pure_embeddings_gpu(llm_obj, audio_embeddings, max_new_tokens=20
                 sys.stdout.flush()
 
         inject_time = time.time() - inject_start
-        logger.info(f"\n注入完成. 耗时: {inject_time:.4f}s (平均: {n_tokens/inject_time:.1f} t/s)")
+        print(f"\n[OK] Injection Done. Time: {inject_time:.4f}s (Avg: {n_tokens/inject_time:.1f} t/s)")
 
         # ---------------------------------------------------------------------
-        # 阶段 B: 文本生成 (Greedy Search)
+        # 阶段 B: 文本生成 (Greedy Search) - 完全复制自 06
         # ---------------------------------------------------------------------
-        generated_text = ""
-        logger.info(f"开始生成文本 (最大 {max_new_tokens} tokens)...\n")
+        print("\n[*] Generating Text:")
+        print("-" * 40)
 
-        eos_token = llm_obj.token_eos()
-        vocab_size = llm_obj.n_vocab()
+        vocab_size = llm.n_vocab()
+        gen_start = time.time()
+        gen_count = 0
+        eos_token = llm.token_eos()
 
-        batch_text.n_tokens = 1
+        full_text = ""
 
-        gen_start_time = time.time()
-        tokens_generated = 0
+        for _ in range(max_new_tokens):
+            # 获取 Logits
+            logits = np.ctypeslib.as_array(llama_get_logits(ctx), shape=(vocab_size,))
+            token_id = int(np.argmax(logits))
 
-        for step in range(max_new_tokens):
-            # 1. 获取 Logits
-            logits_ptr = llama_get_logits(ctx)
-            logits_arr = np.ctypeslib.as_array(logits_ptr, shape=(vocab_size,))
-
-            # 2. 贪婪采样 (Argmax)
-            token_id = int(np.argmax(logits_arr))
-
-            # 3. 检查停止条件
             if token_id == eos_token or token_id in STOP_TOKEN:
                 break
 
-            # 4. 解码 token 为文本
+            # 打印字符
             try:
-                text_piece = llm_obj.detokenize([token_id]).decode('utf-8', errors='ignore')
-                print(text_piece, end="", flush=True)
-                generated_text += text_piece
-                tokens_generated += 1
-            except Exception:
+                txt = llm.detokenize([token_id]).decode('utf-8', errors='ignore')
+                print(txt, end="", flush=True)
+                full_text += txt
+                gen_count += 1
+            except:
                 pass
 
-            # 5. 把生成的 Token 喂回去 (Autoregressive)
+            # 下一步
+            batch_text.n_tokens = 1
             batch_text.token[0] = token_id
-            batch_text.pos[0] = llm_obj.n_tokens
+            batch_text.pos[0] = llm.n_tokens
             batch_text.n_seq_id[0] = 1
             batch_text.seq_id[0][0] = 0
             batch_text.logits[0] = 1
 
             if llama_decode(ctx, batch_text) != 0:
                 break
+            llm.n_tokens += 1
 
-            llm_obj.n_tokens += 1
-
-        print('\n\n')
-        gen_duration = time.time() - gen_start_time
-        tps = tokens_generated / gen_duration if gen_duration > 0 else 0
-
-        logger.info(f"解码速度: {tps:.2f} tokens/s ({tokens_generated} tokens in {gen_duration:.2f}s)\n\n")
+        print("\n" + "-" * 40)
+        gen_time = time.time() - gen_start
+        print(f"[*] Generation Speed: {gen_count/gen_time:.2f} tokens/s")
 
     finally:
         # 释放资源
         llama_batch_free(batch_embd)
         llama_batch_free(batch_text)
 
-    return generated_text
+    return full_text
 
 # =========================================================================
 # 主程序
@@ -253,16 +245,17 @@ def main():
 
     # 2. 加载 GGUF 模型 (GPU 优化配置)
     print(f'\nLoading GGUF model: {gguf_model_path}')
+
     llm = Llama(
         model_path=gguf_model_path,
         n_ctx=MAX_SEQ_LEN + 2048,
         n_batch=2048,
-        n_ubatch=8,
-        f16_kv=False,
-        flash_attn=True,
-        n_gpu_layers=-1,  # 全部使用 GPU
-        embedding=False,
-        verbose=0
+        n_ubatch=64,  # 改为 64，与 06 一致
+        n_gpu_layers=-1,
+        main_gpu=0,
+        split_mode=0,
+        embedding=True,
+        verbose=False
     )
     print('✅ GGUF model loaded successfully (Vulkan Backend Active)')
 
@@ -271,8 +264,8 @@ def main():
     all_embeddings = load_gguf_embeddings(gguf_model_path)
 
     # 4. 准备 Prefix 和 Suffix 的 Embeddings
-    prefix_tokens = tokenizer.encode(PREFIX_PROMPT, add_special_tokens=False)
-    suffix_tokens = tokenizer.encode(SUFFIX_PROMPT, add_special_tokens=False)
+    prefix_tokens = tokenizer.encode(PREFIX_PROMPT, add_special_tokens=True)
+    suffix_tokens = tokenizer.encode(SUFFIX_PROMPT, add_special_tokens=True)
 
     prefix_emb = all_embeddings[prefix_tokens]
     suffix_emb = all_embeddings[suffix_tokens]
