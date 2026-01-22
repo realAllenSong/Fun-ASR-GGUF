@@ -7,7 +7,6 @@ from dataclasses import dataclass
 class Token:
     text: str
     start: float
-    end: float
 
 def load_ctc_tokens(filename):
     """加载 CTC 词表"""
@@ -40,34 +39,32 @@ def decode_ctc(logits, id2token):
         start_idx = 0
         for i in range(1, len(indices)):
             if indices[i] != current_id:
-                collapsed.append((current_id, start_idx, i)) 
+                collapsed.append((current_id, start_idx))
                 current_id = indices[i]
                 start_idx = i
-        collapsed.append((current_id, start_idx, len(indices)))
-    
+        collapsed.append((current_id, start_idx))
+
     results = []
-    
+
     # 2. Filter blanks and decode text
-    for token_id, start, end in collapsed:
+    for token_id, start in collapsed:
         if token_id == blank_id:
             continue
-            
+
         token_b64 = id2token.get(token_id, "")
         if not token_b64: continue
-        
+
         try:
             token_text = base64.b64decode(token_b64).decode("utf-8")
         except:
             continue
-            
-        # Calculate time
+
+        # Calculate time (只计算起始位置)
         t_start = max((start * frame_shift_ms + offset_ms) / 1000.0, 0.0)
-        t_end = max((end * frame_shift_ms + offset_ms) / 1000.0, 0.0)
-        
+
         results.append(Token(
-            text=token_text, 
-            start=t_start,
-            end=t_end
+            text=token_text,
+            start=t_start
         ))
                 
     full_text = "".join([r.text for r in results])
@@ -76,64 +73,63 @@ def decode_ctc(logits, id2token):
 def align_timestamps(ctc_results, llm_text):
     """
     使用 Needleman-Wunsch 算法对齐 CTC 结果和 LLM 文本
+    只使用起始位置进行匹配
     """
     if not ctc_results or not llm_text:
         return []
 
-    # 1. 展开 CTC 结果为字符级别
+    # 1. 展开 CTC 结果为字符级别（只保留起始位置）
     ctc_chars = []
     for item in ctc_results:
         text = item.text
         start = item.start
-        end = item.end if item.end else start + 0.1
-        duration = end - start
-        
+
         if len(text) > 0:
-            char_duration = duration / len(text)
+            # 假设每个字符占用相同时间间隔
+            char_duration = 0.08  # 默认每个字符约 80ms
             for i, char in enumerate(text):
                 c_start = start + i * char_duration
-                c_end = start + (i + 1) * char_duration
-                ctc_chars.append({"char": char, "start": c_start, "end": c_end})
-                
+                ctc_chars.append({"char": char, "start": c_start})
+
     llm_chars = list(llm_text)
-    
+
     n = len(ctc_chars) + 1
     m = len(llm_chars) + 1
-    
+
     # Core DP Matrix
     score = np.zeros((n, m), dtype=np.float32)
     # trace: 1=diag, 2=up, 3=left
     trace = np.zeros((n, m), dtype=np.int8)
-    
+
     gap_penalty = -1.0
     match_score = 1.0
     mismatch_score = -1.0
-    
+
     # Init margins
     for i in range(n): score[i][0] = i * gap_penalty
     for j in range(m): score[0][j] = j * gap_penalty
-        
+
     # Fill DP
     for i in range(1, n):
         for j in range(1, m):
             char_ctc = ctc_chars[i-1]["char"]
             char_llm = llm_chars[j-1]
-            
+
             s_diag = score[i-1][j-1] + (match_score if char_ctc.lower() == char_llm.lower() else mismatch_score)
             s_up = score[i-1][j] + gap_penalty
             s_left = score[i][j-1] + gap_penalty
-            
+
             best = max(s_diag, s_up, s_left)
             score[i][j] = best
-            
+
             if best == s_diag: trace[i][j] = 1
             elif best == s_up: trace[i][j] = 2
             else: trace[i][j] = 3
-            
+
     # Traceback
     llm_alignment = [None] * len(llm_chars)
     i, j = n - 1, m - 1
-    
+
     while i > 0 or j > 0:
         if i > 0 and j > 0 and trace[i][j] == 1:
             llm_alignment[j-1] = ctc_chars[i-1]
@@ -144,48 +140,48 @@ def align_timestamps(ctc_results, llm_text):
         elif j > 0 and (i == 0 or trace[i][j] == 3):
             llm_alignment[j-1] = None
             j -= 1
-            
-    # Interpolation
+
+    # 插值填充未对齐的字符
     anchors = []
     for idx, item in enumerate(llm_alignment):
         if item is not None:
-            anchors.append((idx, item["start"], item["end"]))
-            
+            anchors.append((idx, item["start"]))
+
     final_chars = []
-    
-    def get_interpolated(target_idx):
+
+    def get_interpolated_start(target_idx):
+        """插值计算起始位置"""
         prev_a, next_a = None, None
         for a in anchors:
-            if a[0] < target_idx: prev_a = a
+            if a[0] < target_idx:
+                prev_a = a
             elif a[0] > target_idx:
                 next_a = a
                 break
-                
+
         if prev_a and next_a:
-            p_idx, _, p_end = prev_a
-            n_idx, n_start, _ = next_a
-            
-            # Simple linear interpolation
-            total_gap_frames = n_idx - p_idx
-            time_gap = max(n_start - p_end, 0.0)
-            step = time_gap / total_gap_frames
-            
+            p_idx, p_start = prev_a
+            n_idx, n_start = next_a
+
+            # 线性插值
+            total_gap = n_idx - p_idx
+            time_gap = n_start - p_start
+            step = time_gap / total_gap
+
             relative_step = target_idx - p_idx
-            s = p_end + (relative_step - 1) * step
-            e = p_end + relative_step * step
-            return s, e
+            return p_start + relative_step * step
         elif prev_a:
-            return prev_a[2], prev_a[2] + 0.05
+            return prev_a[1] + 0.05  # 向后推一点
         elif next_a:
-            return max(0, next_a[1] - 0.05), next_a[1]
+            return max(0, next_a[1] - 0.05)  # 向前推一点
         else:
-            return 0.0, 0.05
+            return 0.0
 
     for idx, char in enumerate(llm_chars):
         if llm_alignment[idx]:
-            s, e = llm_alignment[idx]["start"], llm_alignment[idx]["end"]
+            s = llm_alignment[idx]["start"]
         else:
-            s, e = get_interpolated(idx)
-        final_chars.append({"char": char, "start": s, "end": e})
-        
+            s = get_interpolated_start(idx)
+        final_chars.append({"char": char, "start": s})
+
     return final_chars

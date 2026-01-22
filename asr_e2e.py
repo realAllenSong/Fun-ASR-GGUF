@@ -47,7 +47,7 @@ INPUT_AUDIO         = "input.mp3"
 CONTEXT             = "这是1004期睡前消息节目，主持人叫督工，助理叫静静"
 
 # 是否启用 CTC 辅助 (开启后可提供时间戳和热词回忆，关闭则仅使用 LLM)
-ENABLE_CTC          = False
+ENABLE_CTC          = True
 
 # 语言设置
 # 中文、英文、日文 for Fun-ASR-Nano-2512
@@ -412,9 +412,9 @@ def main():
     
     # 打印对齐结果
     print(f"    对齐耗时: {t_align*1000:.2f}ms")
-    print(f"    最终结果 (前50字符):")
+    print(f"    最终结果 (前10个字符):")
     for r in aligned_result[:10]:
-        print(f"      {r['start']:.2f}-{r['end']:.2f}: {r['char']}")
+        print(f"      {r['start']:.2f}s: {r['char']}")
     if len(aligned_result) > 10: print("      ...")
     
     # 统计
@@ -444,7 +444,6 @@ def main():
     nano_llama.llama_model_free(model)
     nano_llama.llama_backend_free()
     
-    print("\n[完成]")
     return 0
 
 if __name__ == "__main__":
