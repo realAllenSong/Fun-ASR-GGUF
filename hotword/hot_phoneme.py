@@ -28,10 +28,10 @@ except ImportError:
     log_path = LOG_DIR / "hotword_corrector.log"
 
     logger = logging.getLogger("HotwordCorrector")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     if not logger.handlers:
         fh = logging.FileHandler(log_path, encoding='utf-8', mode='a')
-        fh.setLevel(logging.DEBUG)
+        fh.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         fh.setFormatter(formatter)
         logger.addHandler(fh)
