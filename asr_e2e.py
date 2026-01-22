@@ -40,7 +40,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 模型路径
 MODEL_DIR           = os.path.join(SCRIPT_DIR, "model-gguf")
-ENCODER_ONNX_PATH   = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Encoder-Adaptor.int8.onnx")  
+ENCODER_ONNX_PATH   = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Encoder-Adaptor.fp32.onnx")  
 CTC_ONNX_PATH       = os.path.join(MODEL_DIR, "Fun-ASR-Nano-CTC.int8.onnx")
 DECODER_GGUF_PATH   = os.path.join(MODEL_DIR, "Fun-ASR-Nano-Decoder.q8_0.gguf")
 TOKENS_PATH         = os.path.join(MODEL_DIR, "tokens.txt")
@@ -53,12 +53,19 @@ LLAMA_DLL_PATH = os.path.join(BIN_DIR, "llama.dll")
 GGML_BASE_DLL_PATH = os.path.join(BIN_DIR, "ggml-base.dll")
 
 # 输入音频
-INPUT_AUDIO = os.path.join(SCRIPT_DIR, "input2.mp3")
+INPUT_AUDIO = os.path.join(SCRIPT_DIR, "input.mp3")
 
 # ASR Prompts
 # 默认热词表（在本例中用于简单匹配）
 DEFAULT_HOTWORDS = ['Claude Code', 'Antigravity', 'SenseVoice', 'FunASR']
 STOP_TOKENS = [151643, 151645]
+# 语言设置
+# 中文、英文、日文 for Fun-ASR-Nano-2512
+# 中文、英文、粤语、日文、韩文、越南语、印尼语、泰语、马来语、菲律宾语、阿拉伯语、
+# 印地语、保加利亚语、克罗地亚语、捷克语、丹麦语、荷兰语、爱沙尼亚语、芬兰语、希腊语、
+# 匈牙利语、爱尔兰语、拉脱维亚语、立陶宛语、马耳他语、波兰语、葡萄牙语、罗马尼亚语、
+# 斯洛伐克语、斯洛文尼亚语、瑞典语 for Fun-ASR-MLT-Nano-2512
+LANGUAGE = None
 
 # 音频参数
 SAMPLE_RATE = 16000
@@ -619,19 +626,23 @@ def run_ctc_pass(ctc_sess, enc_output, ctc_id2token, hotword_list):
     
     return matched_hws, t_cost
 
-def prepare_prompt_embeddings(vocab, embedding_table, matched_hotwords=None):
+def prepare_prompt_embeddings(vocab, embedding_table, matched_hotwords=None, language=LANGUAGE):
     """步骤 6: 生成 Prompt"""
-    print("\n[6] 生成 Prompt")
+    print(f"\n[6] 生成 Prompt (语言: {language})")
     
     PREFIX_PROMPT = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
-    SUFFIX_PROMPT = "\n<|im_end|>\n<|im_start|>assistant"
+    SUFFIX_PROMPT = "<|im_end|>\n<|im_start|>assistant"
 
     if matched_hotwords:
         hotwords = ", ".join(matched_hotwords)
         PREFIX_PROMPT += f"请结合上下文信息，更加准确地完成语音转写任务。如果没有相关信息，我们会留空。\n\n\n**上下文信息：**\n\n\n"
         PREFIX_PROMPT += f"热词列表：[{hotwords}]\n"
     
-    PREFIX_PROMPT += "\n语音转写：\n"
+    # 语言设置 - 对齐官方实现 (model.py:564-568)
+    if language is None:
+        PREFIX_PROMPT += "语音转写："
+    else:
+        PREFIX_PROMPT += f"语音转写成{language}："
     
     prefix_tokens = text_to_tokens(vocab, PREFIX_PROMPT)
     suffix_tokens = text_to_tokens(vocab, SUFFIX_PROMPT)
@@ -785,7 +796,7 @@ def main():
     matched_hws, t_ctc_cost = run_ctc_pass(ctc_sess, enc_output, ctc_id2token, DEFAULT_HOTWORDS)
     
     # 准备提示词
-    prefix_embd, suffix_embd, n_prefix, n_suffix = prepare_prompt_embeddings(vocab, embedding_table, matched_hws)
+    prefix_embd, suffix_embd, n_prefix, n_suffix = prepare_prompt_embeddings(vocab, embedding_table, matched_hws, LANGUAGE)
     
     # 拼接 embd
     full_embd = np.concatenate([prefix_embd, audio_embd.astype(np.float32), suffix_embd], axis=0)

@@ -4,6 +4,7 @@ transformers
 numpy 
 onnx
 onnxruntime 
+onnxconverter_common
 gguf
 funasr
 pydub
