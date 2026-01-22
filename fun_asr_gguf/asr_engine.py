@@ -95,6 +95,7 @@ class FunASREngine:
         self.encoder_sess = None
         self.ctc_sess = None
         self.model = None
+        self.ctx = None  # LLM 上下文（复用）
         self.vocab = None
         self.eos_token = None
         self.embedding_table = None
@@ -126,14 +127,14 @@ class FunASREngine:
             t_start = time.perf_counter()
 
             # 1. 加载 ONNX 模型
-            self._log("[1/5] 加载 ONNX 模型...", verbose)
+            self._log("[1/6] 加载 ONNX 模型...", verbose)
             self.encoder_sess, self.ctc_sess, _ = load_onnx_models(
                 self.encoder_onnx_path,
                 self.ctc_onnx_path
             )
 
             # 2. 加载 GGUF LLM
-            self._log("[2/5] 加载 GGUF LLM Decoder...", verbose)
+            self._log("[2/6] 加载 GGUF LLM Decoder...", verbose)
             nano_llama.init_llama_lib()
 
             model_params = nano_llama.llama_model_default_params()
@@ -149,17 +150,23 @@ class FunASREngine:
             self.eos_token = nano_llama.llama_vocab_eos(self.vocab)
 
             # 3. 加载 Embedding 权重
-            self._log("[3/5] 加载 Embedding 权重...", verbose)
+            self._log("[3/6] 加载 Embedding 权重...", verbose)
             self.embedding_table = nano_llama.get_token_embeddings_gguf(self.decoder_gguf_path)
             if self.embedding_table is None:
                 raise RuntimeError("Failed to load embedding weights")
 
-            # 4. 加载 CTC 词表
-            self._log("[4/5] 加载 CTC 词表...", verbose)
+            # 4. 创建 LLM 上下文（复用）
+            self._log("[4/6] 创建 LLM 上下文...", verbose)
+            self.ctx = self._create_context()
+            if not self.ctx:
+                raise RuntimeError("Failed to create LLM context")
+
+            # 5. 加载 CTC 词表
+            self._log("[5/6] 加载 CTC 词表...", verbose)
             self.ctc_id2token = load_ctc_tokens(self.tokens_path)
 
-            # 5. 初始化热词纠错器
-            self._log("[5/5] 初始化热词纠错器...", verbose)
+            # 6. 初始化热词纠错器
+            self._log("[6/6] 初始化热词纠错器...", verbose)
             self.corrector = PhonemeCorrector(threshold=0.8)
 
             if os.path.exists(self.hotwords_path):
@@ -180,6 +187,18 @@ class FunASREngine:
         except Exception as e:
             self._log(f"✗ 初始化失败: {e}", True)
             return False
+
+    def _create_context(self):
+        """创建 LLM 上下文"""
+        ctx_params = nano_llama.llama_context_default_params()
+        ctx_params.n_ctx = 2048
+        ctx_params.n_batch = 2048
+        ctx_params.n_ubatch = self.n_ubatch
+        ctx_params.embeddings = False
+        ctx_params.no_perf = True
+        ctx_params.n_threads = self.n_threads
+        ctx_params.n_threads_batch = self.n_threads_batch
+        return nano_llama.llama_init_from_model(self.model, ctx_params)
 
     def _process_audio(self, audio_path: str) -> Tuple[np.ndarray, np.ndarray, int]:
         """处理音频文件"""
@@ -265,96 +284,81 @@ class FunASREngine:
         Returns:
             (生成的文本, 生成token数, 注入时间, 生成时间)
         """
-        # 创建上下文
-        ctx_params = nano_llama.llama_context_default_params()
-        ctx_params.n_ctx = 2048
-        ctx_params.n_batch = 2048
-        ctx_params.n_ubatch = self.n_ubatch
-        ctx_params.embeddings = False
-        ctx_params.no_perf = True
-        ctx_params.n_threads = self.n_threads
-        ctx_params.n_threads_batch = self.n_threads_batch
 
-        ctx = nano_llama.llama_init_from_model(self.model, ctx_params)
-        if not ctx:
-            raise RuntimeError("Failed to create context")
+        t_inject_start = time.perf_counter()
+        # 清空 KV cache（复用上下文），注入 embeddings
+        mem = nano_llama.llama_get_memory(self.ctx)
+        nano_llama.llama_memory_clear(mem, True)
+        batch_embd = nano_llama.llama_batch_init(n_input_tokens, full_embd.shape[1], 1)
+        batch_embd.n_tokens = n_input_tokens
+        batch_embd.token = ctypes.cast(None, ctypes.POINTER(nano_llama.llama_token))
 
-        try:
-            # 1. 注入 embeddings
-            t_inject_start = time.perf_counter()
-            batch_embd = nano_llama.llama_batch_init(n_input_tokens, full_embd.shape[1], 1)
-            batch_embd.n_tokens = n_input_tokens
-            batch_embd.token = ctypes.cast(None, ctypes.POINTER(nano_llama.llama_token))
+        if not full_embd.flags['C_CONTIGUOUS']:
+            full_embd = np.ascontiguousarray(full_embd)
+        ctypes.memmove(batch_embd.embd, full_embd.ctypes.data, full_embd.nbytes)
 
-            if not full_embd.flags['C_CONTIGUOUS']:
-                full_embd = np.ascontiguousarray(full_embd)
-            ctypes.memmove(batch_embd.embd, full_embd.ctypes.data, full_embd.nbytes)
+        for k in range(n_input_tokens):
+            batch_embd.pos[k] = k
+            batch_embd.n_seq_id[k] = 1
+            batch_embd.seq_id[k][0] = 0
+            batch_embd.logits[k] = 1 if k == n_input_tokens - 1 else 0
 
-            for k in range(n_input_tokens):
-                batch_embd.pos[k] = k
-                batch_embd.n_seq_id[k] = 1
-                batch_embd.seq_id[k][0] = 0
-                batch_embd.logits[k] = 1 if k == n_input_tokens - 1 else 0
+        ret = nano_llama.llama_decode(self.ctx, batch_embd)
+        nano_llama.llama_batch_free(batch_embd)
 
-            ret = nano_llama.llama_decode(ctx, batch_embd)
-            nano_llama.llama_batch_free(batch_embd)
+        if ret != 0:
+            raise RuntimeError(f"Decode failed (ret={ret})")
 
-            if ret != 0:
-                raise RuntimeError(f"Decode failed (ret={ret})")
+        t_inject = time.perf_counter() - t_inject_start
 
-            t_inject = time.perf_counter() - t_inject_start
+        # 2. 生成文本
+        t_gen_start = time.perf_counter()
+        vocab_size = nano_llama.llama_vocab_n_tokens(self.vocab)
+        batch_text = nano_llama.llama_batch_init(1, 0, 1)
+        batch_text.n_tokens = 1
 
-            # 2. 生成文本
-            t_gen_start = time.perf_counter()
-            vocab_size = nano_llama.llama_vocab_n_tokens(self.vocab)
-            batch_text = nano_llama.llama_batch_init(1, 0, 1)
-            batch_text.n_tokens = 1
+        generated_text = ""
+        current_pos = n_input_tokens
+        decoder = nano_llama.ByteDecoder()
+        tokens_generated = 0
 
-            generated_text = ""
-            current_pos = n_input_tokens
-            decoder = nano_llama.ByteDecoder()
-            tokens_generated = 0
+        for _ in range(self.n_predict):
+            logits_ptr = nano_llama.llama_get_logits(self.ctx)
+            logits_arr = np.ctypeslib.as_array(logits_ptr, shape=(vocab_size,))
+            token_id = int(np.argmax(logits_arr))
 
-            for _ in range(self.n_predict):
-                logits_ptr = nano_llama.llama_get_logits(ctx)
-                logits_arr = np.ctypeslib.as_array(logits_ptr, shape=(vocab_size,))
-                token_id = int(np.argmax(logits_arr))
+            if token_id == self.eos_token or token_id in self.stop_tokens:
+                break
 
-                if token_id == self.eos_token or token_id in self.stop_tokens:
-                    break
+            raw_bytes = nano_llama.token_to_bytes(self.vocab, token_id)
+            text_piece = decoder.decode(raw_bytes)
+            generated_text += text_piece
+            tokens_generated += 1
 
-                raw_bytes = nano_llama.token_to_bytes(self.vocab, token_id)
-                text_piece = decoder.decode(raw_bytes)
-                generated_text += text_piece
-                tokens_generated += 1
+            # 流式输出
+            if stream_output:
+                print(text_piece, end="", flush=True)
 
-                # 流式输出
-                if stream_output:
-                    print(text_piece, end="", flush=True)
+            batch_text.token[0] = token_id
+            batch_text.pos[0] = current_pos
+            batch_text.n_seq_id[0] = 1
+            batch_text.seq_id[0][0] = 0
+            batch_text.logits[0] = 1
 
-                batch_text.token[0] = token_id
-                batch_text.pos[0] = current_pos
-                batch_text.n_seq_id[0] = 1
-                batch_text.seq_id[0][0] = 0
-                batch_text.logits[0] = 1
+            if nano_llama.llama_decode(self.ctx, batch_text) != 0:
+                break
 
-                if nano_llama.llama_decode(ctx, batch_text) != 0:
-                    break
+            current_pos += 1
 
-                current_pos += 1
+        remaining = decoder.flush()
+        generated_text += remaining
+        if stream_output and remaining:
+            print(remaining, end="", flush=True)
 
-            remaining = decoder.flush()
-            generated_text += remaining
-            if stream_output and remaining:
-                print(remaining, end="", flush=True)
+        nano_llama.llama_batch_free(batch_text)
+        t_gen = time.perf_counter() - t_gen_start
 
-            t_gen = time.perf_counter() - t_gen_start
-            nano_llama.llama_batch_free(batch_text)
-
-            return generated_text, tokens_generated, t_inject, t_gen
-
-        finally:
-            nano_llama.llama_free(ctx)
+        return generated_text, tokens_generated, t_inject, t_gen
 
     def transcribe(
         self,
@@ -623,6 +627,9 @@ class FunASREngine:
 
     def cleanup(self):
         """清理资源"""
+        if self.ctx:
+            nano_llama.llama_free(self.ctx)
+            self.ctx = None
         if self.model:
             nano_llama.llama_model_free(self.model)
             nano_llama.llama_backend_free()

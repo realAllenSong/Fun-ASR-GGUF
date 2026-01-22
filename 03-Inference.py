@@ -81,6 +81,14 @@ def main():
         verbose=verbose
     )
 
+    input('回车继续')
+    result = engine.transcribe(
+        audio_file, 
+        language=language, 
+        context=context, 
+        verbose=verbose
+    )
+
     # 输出结果
     if json_output:
         import json
