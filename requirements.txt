@@ -9,6 +9,7 @@ gguf
 rich
 watchdog
 pypinyin
+srt
 
 # ==================== 模型导出依赖 ====================
 

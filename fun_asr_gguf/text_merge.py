@@ -9,78 +9,106 @@ from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
+import difflib
+
 def merge_transcription_results(
     results: List[Dict[str, Any]], 
-    chunk_offsets: List[float], 
-    overlap: float
+    segment_offsets: List[float], 
+    overlap_s: float
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    合并多个片段的识别结果
-    
-    采用基于时间戳的初步切分和基于字符匹配的精细去重策略。
+    高度鲁棒的合并算法，使用 SequenceMatcher 寻找重叠区对齐点
     """
     if not results:
         return "", []
     
     if len(results) == 1:
-        offset = chunk_offsets[0]
-        full_text = results[0]['text']
+        offset = segment_offsets[0]
         full_segments = []
         for seg in results[0].get('segments') or []:
-            full_segments.append({
-                'char': seg['char'],
-                'start': seg['start'] + offset
-            })
-        return full_text, full_segments
+            full_segments.append({'char': seg['char'], 'start': seg['start'] + offset})
+        return results[0]['text'], full_segments
 
     full_segments = []
+    puncs = set("，。！？；,.!?; ")
     
-    # 我们维护一个当前已保留的全局字符列表
     for i, res in enumerate(results):
-        offset = chunk_offsets[i]
+        offset = segment_offsets[i]
         curr_segments = res.get('segments') or []
-        if not curr_segments and res['text']:
-            # 如果没有时间戳对齐结果，尝试简单构造一个（均匀分布）
-            duration = res['duration']
-            chars = list(res['text'])
-            t_per_c = duration / max(1, len(chars))
-            curr_segments = [{'char': c, 'start': idx * t_per_c} for idx, c in enumerate(chars)]
-        
-        # 将当前片段的时间戳转为全局时间戳
         for seg in curr_segments:
             seg['_global_start'] = seg['start'] + offset
 
         if i == 0:
-            # 第一个片段，保留直到 overlap 区域中间的部分
-            cutoff = res['duration'] - overlap / 2
-            for seg in curr_segments:
-                if seg['start'] < cutoff:
-                    full_segments.append({'char': seg['char'], 'start': seg['_global_start']})
-        else:
-            # 后续片段，首先找到与已有结果的衔接点
-            # 我们看当前片段在 overlap 区域（0 ~ overlap）内的内容
-            # 与 full_segments 末尾的内容进行匹配
-            
-            # 这里的简单策略：
-            # 1. 丢弃当前片段开头 0.5 * overlap 之前的所有字符（因为它们在上一片段已经处理过）
-            # 2. 从上一片段保留的末尾字符开始，寻找重叠
-            
-            start_search_time = overlap / 2
-            # 如果不是最后一个片段，还要考虑结尾切割
-            end_cutoff = res['duration'] - overlap / 2 if i < len(results) - 1 else res['duration'] + 1
-            
-            # 在衔接处做一点模糊匹配去重
-            # 找到当前片段中，时间戳在 [overlap/2 - 1.0, overlap/2 + 1.0] 范围内的字符
-            # 看看是否已经在 full_segments 中存在
-            
-            last_global_time = full_segments[-1]['start'] if full_segments else -1.0
-            
-            for seg in curr_segments:
-                # 策略：如果当前字符的全局时间明显大于已有的最后一个字符时间，则接纳
-                # 这里的 0.05 是一个小冗余，防止微小的时间差导致重复
-                if seg['_global_start'] > last_global_time + 0.05:
-                    if seg['start'] < end_cutoff:
-                        full_segments.append({'char': seg['char'], 'start': seg['_global_start']})
+            full_segments.extend([{'char': s['char'], 'start': s['_global_start']} for s in curr_segments])
+            continue
 
-    full_text = "".join([s['char'] for s in full_segments])
-    return full_text, full_segments
+        if not curr_segments:
+            continue
+
+        # --- 寻找对齐点 ---
+        # 提取 buffer 末尾和新片段开头
+        # 我们关注 global_start 在 [offset - 2, offset + overlap_s + 2] 之间的部分
+        buffer_overlap_segs = [s for s in full_segments if s['start'] >= offset - 1.0]
+        buffer_overlap_text = "".join([s['char'] for s in buffer_overlap_segs])
+        
+        # 提取新片段的前 60 个字符作为匹配源
+        curr_overlap_limit = overlap_s + 1.0
+        curr_overlap_segs = [s for s in curr_segments if s['start'] <= curr_overlap_limit]
+        curr_overlap_text = "".join([s['char'] for s in curr_overlap_segs])
+        
+        # 使用 SequenceMatcher 寻找最佳对齐
+        sm = difflib.SequenceMatcher(None, buffer_overlap_text, curr_overlap_text)
+        match = sm.find_longest_match(0, len(buffer_overlap_text), 0, len(curr_overlap_text))
+        
+        if match.size >= 2: # 至少匹配上 2 个字符
+            # match.a 是 buffer_overlap_text 中的对齐点
+            # match.b 是 curr_overlap_text 中的对齐点
+            
+            # a. 截断 buffer
+            # buffer_overlap_segs[match.a] 对应的全局索引
+            target_seg = buffer_overlap_segs[match.a]
+            
+            # 找到 target_seg 在 full_segments 中的索引 (从后往前找最接近的一个)
+            try:
+                global_idx = -1
+                for idx in range(len(full_segments)-1, -1, -1):
+                    if full_segments[idx]['start'] == target_seg['start'] and full_segments[idx]['char'] == target_seg['char']:
+                        global_idx = idx
+                        break
+                
+                if global_idx != -1:
+                    full_segments = full_segments[:global_idx]
+            except:
+                pass
+            
+            # b. 添加新片段从 match.b 开始的内容
+            # match.b 是 curr_overlap_text 中的索引，对应 curr_overlap_segs
+            # 我们需要找到它在 curr_segments 中的原始索引
+            match_idx_in_curr = -1
+            match_seg = curr_overlap_segs[match.b]
+            for idx, s in enumerate(curr_segments):
+                if s is match_seg: # 对象级别匹配最准确
+                    match_idx_in_curr = idx
+                    break
+            
+            if match_idx_in_curr != -1:
+                to_add = curr_segments[match_idx_in_curr:]
+                full_segments.extend([{'char': s['char'], 'start': s['_global_start']} for s in to_add])
+            else:
+                # 几乎不可能
+                full_segments.extend([{'char': s['char'], 'start': s['_global_start']} for s in curr_segments])
+        else:
+            # 兜底：基于时间戳硬拼接
+            last_time = full_segments[-1]['start'] if full_segments else offset
+            to_add = [s for s in curr_segments if s['_global_start'] > last_time + 0.1]
+            full_segments.extend([{'char': s['char'], 'start': s['_global_start']} for s in to_add])
+
+    # 后处理：清理标点重复和残留
+    clean_segments = []
+    for s in full_segments:
+        if clean_segments and s['char'] in puncs and clean_segments[-1]['char'] == s['char']:
+            continue
+        clean_segments.append(s)
+
+    full_text = "".join([s['char'] for s in clean_segments])
+    return full_text, clean_segments

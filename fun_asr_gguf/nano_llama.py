@@ -129,8 +129,9 @@ def init_llama_lib():
     global llama_vocab_n_tokens, llama_vocab_eos, llama_token_to_piece
     global _log_callback_ref
 
-    # 获取模块所在目录
-    lib_dir = os.path.dirname(os.path.abspath(__file__))
+    # 获取模块所在目录下的 bin 目录
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    lib_dir = os.path.join(base_dir, "bin")
 
     GGML_DLL_PATH = os.path.join(lib_dir, "ggml.dll")
     LLAMA_DLL_PATH = os.path.join(lib_dir, "llama.dll")

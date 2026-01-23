@@ -143,8 +143,8 @@ class ASREngineConfig:
     n_threads: Optional[int] = None
     n_threads_batch: Optional[int] = None
     n_ubatch: int = 512
-    similar_threshold: float = 0.8
-    max_hotwords: int = 20
+    similar_threshold: float = 0.6
+    max_hotwords: int = 10
     sample_rate: int = 16000
 
 

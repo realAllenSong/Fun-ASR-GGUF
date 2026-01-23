@@ -16,7 +16,7 @@ from fun_asr_gguf import create_asr_engine
 # ==================== 配置区域 ====================
 
 # 音频文件路径
-audio_file = "input.mp3"
+audio_file = "input5.mp3"
 
 # 语言设置（None=自动检测, "中文", "英文", "日文" 等）
 language = None
@@ -80,14 +80,20 @@ def main():
         audio_file, 
         language=language, 
         context=context, 
-        verbose=False
+        verbose=False, 
+        duration=10.0,
     )
 
     result = engine.transcribe(
         audio_file, 
         language=language, 
         context=context, 
-        verbose=verbose
+        verbose=verbose,
+        segment_size=60.0,
+        overlap=4.0,
+        start_second=0.0,
+        duration=300.0,
+        srt=True
     )
 
     # 输出结果
