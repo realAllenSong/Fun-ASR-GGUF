@@ -20,8 +20,8 @@ from . import nano_llama
 from .nano_ctc import load_ctc_tokens, decode_ctc, align_timestamps
 from .nano_audio import load_audio
 from .nano_onnx import load_onnx_models, encode_audio
-from .hotword.hot_phoneme import PhonemeCorrector
-from .types import (
+from .hotword.manager import get_hotword_manager
+from .nano_dataclass import (
     RecognitionResult,
     RecognitionStream,
     TranscriptionResult,
@@ -39,6 +39,14 @@ from .types import (
 # os.environ["GGML_VK_DISABLE_F16"] = "1"       # 禁止 VulkanFP16 计算（Intel集显fp16有溢出问题）
 
 
+# ==================== 辅助函数 ====================
+
+def vprint(message: str, verbose: bool = True):
+    """条件打印：仅在 verbose=True 时打印"""
+    if verbose:
+        print(message)
+
+
 class FunASREngine:
     """FunASR 推理引擎（兼容 sherpa-onnx API）"""
 
@@ -52,7 +60,6 @@ class FunASREngine:
         enable_ctc: bool = True,
         n_predict: int = 512,
         n_threads: int = None,
-        quiet_mode: bool = True,
     ):
         """
         初始化 ASR 引擎
@@ -66,7 +73,6 @@ class FunASREngine:
             enable_ctc: 是否启用 CTC 辅助
             n_predict: 最大生成 token 数
             n_threads: 线程数
-            quiet_mode: 静默模式
         """
         # 配置参数
         self.script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,11 +85,9 @@ class FunASREngine:
         self.hotwords_path = hotwords_path or os.path.join(self.script_dir, "hot.txt")
 
         self.enable_ctc = enable_ctc
-        self.hotwords_path = hotwords_path or os.path.join(self.script_dir, "hot.txt")
         self.n_predict = n_predict
         self.n_threads = n_threads or (os.cpu_count() // 2)
         self.n_threads_batch = os.cpu_count()
-        self.quiet_mode = quiet_mode
 
         # 推理参数
         self.sample_rate = 16000
@@ -100,14 +104,12 @@ class FunASREngine:
         self.eos_token = None
         self.embedding_table = None
         self.ctc_id2token = None
+        self.hotword_manager = None
         self.corrector = None
 
         self._initialized = False
 
-    def _log(self, message: str, force: bool = False):
-        """打印日志（除非在静默模式）"""
-        if not self.quiet_mode or force:
-            print(message)
+
 
     def initialize(self, verbose: bool = True) -> bool:
         """
@@ -120,21 +122,21 @@ class FunASREngine:
             是否初始化成功
         """
         if self._initialized:
-            self._log("[ASR] 模型已初始化", True)
+            vprint("[ASR] 模型已初始化", verbose)
             return True
 
         try:
             t_start = time.perf_counter()
 
             # 1. 加载 ONNX 模型
-            self._log("[1/6] 加载 ONNX 模型...", verbose)
+            vprint("[1/6] 加载 ONNX 模型...", verbose)
             self.encoder_sess, self.ctc_sess, _ = load_onnx_models(
                 self.encoder_onnx_path,
                 self.ctc_onnx_path
             )
 
             # 2. 加载 GGUF LLM
-            self._log("[2/6] 加载 GGUF LLM Decoder...", verbose)
+            vprint("[2/6] 加载 GGUF LLM Decoder...", verbose)
             nano_llama.init_llama_lib()
 
             model_params = nano_llama.llama_model_default_params()
@@ -150,42 +152,42 @@ class FunASREngine:
             self.eos_token = nano_llama.llama_vocab_eos(self.vocab)
 
             # 3. 加载 Embedding 权重
-            self._log("[3/6] 加载 Embedding 权重...", verbose)
+            vprint("[3/6] 加载 Embedding 权重...", verbose)
             self.embedding_table = nano_llama.get_token_embeddings_gguf(self.decoder_gguf_path)
             if self.embedding_table is None:
                 raise RuntimeError("Failed to load embedding weights")
 
             # 4. 创建 LLM 上下文（复用）
-            self._log("[4/6] 创建 LLM 上下文...", verbose)
+            vprint("[4/6] 创建 LLM 上下文...", verbose)
             self.ctx = self._create_context()
             if not self.ctx:
                 raise RuntimeError("Failed to create LLM context")
 
             # 5. 加载 CTC 词表
-            self._log("[5/6] 加载 CTC 词表...", verbose)
+            vprint("[5/6] 加载 CTC 词表...", verbose)
             self.ctc_id2token = load_ctc_tokens(self.tokens_path)
 
-            # 6. 初始化热词纠错器
-            self._log("[6/6] 初始化热词纠错器...", verbose)
-            self.corrector = PhonemeCorrector(threshold=0.8)
+            # 6. 初始化热词管理器
+            vprint("[6/6] 初始化热词管理器...", verbose)
+            from pathlib import Path
+            self.hotword_manager = get_hotword_manager(
+                hotword_file=Path(self.hotwords_path),
+                threshold=0.8
+            )
+            self.hotword_manager.load()
+            self.hotword_manager.start_file_watcher()
+            self.corrector = self.hotword_manager.get_corrector()
 
-            if os.path.exists(self.hotwords_path):
-                with open(self.hotwords_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    loaded_count = self.corrector.update_hotwords(content)
-                    self._log(f"      已加载 {loaded_count} 条热词", verbose)
-            else:
-                self.corrector.update_hotwords("")
 
             self._initialized = True
 
             t_cost = time.perf_counter() - t_start
-            self._log(f"✓ 模型加载完成 (耗时: {t_cost:.2f}s)", True)
+            vprint(f"✓ 模型加载完成 (耗时: {t_cost:.2f}s)")
 
             return True
 
         except Exception as e:
-            self._log(f"✗ 初始化失败: {e}", True)
+            vprint(f"✗ 初始化失败: {e}")
             return False
 
     def _create_context(self):
@@ -388,23 +390,23 @@ class FunASREngine:
         try:
             t_start = time.perf_counter()
 
-            self._log(f"\n{'='*70}", verbose)
-            self._log(f"处理音频: {os.path.basename(audio_path)}", verbose)
-            self._log(f"{'='*70}", verbose)
+            vprint(f"\n{'='*70}", verbose)
+            vprint(f"处理音频: {os.path.basename(audio_path)}", verbose)
+            vprint(f"{'='*70}", verbose)
 
             # 1. 加载音频
-            self._log("\n[1] 加载音频...", verbose)
+            vprint("\n[1] 加载音频...", verbose)
             audio = load_audio(audio_path, self.sample_rate)
             audio_len = len(audio)
             audio_duration = audio_len / self.sample_rate
-            self._log(f"    音频长度: {audio_duration:.2f}s", verbose)
+            vprint(f"    音频长度: {audio_duration:.2f}s", verbose)
 
             # 2. 创建流并解码（复用 decode_stream）
             stream = self.create_stream()
             stream.accept_waveform(self.sample_rate, audio)
 
-            # 调用 decode_stream 并获取内部结果
-            decode_result = self.decode_stream(stream, language=language, context=context, verbose=verbose, _return_internal=True)
+            # 调用 decode_stream 并获取结果
+            decode_result = self.decode_stream(stream, language=language, context=context, verbose=verbose)
 
             # 复制计时信息
             timings.encode = decode_result.timings.encode
@@ -439,23 +441,23 @@ class FunASREngine:
                 stats.tps_in = (decode_result.audio_embd.shape[0] + decode_result.n_prefix + decode_result.n_suffix) / timings.inject if timings.inject > 0 else 0
                 stats.tps_out = decode_result.n_gen / timings.llm_generate if timings.llm_generate > 0 else 0
 
-                print(f"\n[统计]\n{stats}")
+                vprint(f"\n[统计]\n{stats}", verbose)
 
                 # 格式化耗时显示（与 asr_e2e.py 一致）
-                print(f"\n[转录耗时]")
-                print(f"  - 音频编码： {timings.encode*1000:5.0f}ms")
-                print(f"  - CTC解码：  {timings.ctc*1000:5.0f}ms")
-                print(f"  - LLM读取：  {timings.inject*1000:5.0f}ms")
-                print(f"  - LLM生成：  {timings.llm_generate*1000:5.0f}ms")
+                vprint(f"\n[转录耗时]", verbose)
+                vprint(f"  - 音频编码： {timings.encode*1000:5.0f}ms", verbose)
+                vprint(f"  - CTC解码：  {timings.ctc*1000:5.0f}ms", verbose)
+                vprint(f"  - LLM读取：  {timings.inject*1000:5.0f}ms", verbose)
+                vprint(f"  - LLM生成：  {timings.llm_generate*1000:5.0f}ms", verbose)
                 if decode_result.aligned:
-                    print(f"  - 时间戳对齐:{timings.align*1000:5.0f}ms")
-                print(f"  - 总耗时：   {timings.total:5.2f}s")
-                print()
+                    vprint(f"  - 时间戳对齐:{timings.align*1000:5.0f}ms", verbose)
+                vprint(f"  - 总耗时：   {timings.total:5.2f}s", verbose)
+                vprint("", verbose)
 
             return result
 
         except Exception as e:
-            self._log(f"\n✗ 转录失败: {e}", True)
+            print(f"\n✗ 转录失败: {e}")
             raise
 
     def create_stream(self, hotwords: Optional[str] = None) -> RecognitionStream:
@@ -478,8 +480,7 @@ class FunASREngine:
         language: Optional[str] = None,
         context: Optional[str] = None,
         verbose: bool = False,
-        _return_internal: bool = False
-    ):
+    ) -> DecodeResult:
         """
         解码单个音频流（兼容 sherpa-onnx API）
 
@@ -488,11 +489,9 @@ class FunASREngine:
             language: 目标语言（如 "中文", "英文", "日文"）
             context: 上下文信息
             verbose: 是否打印详细信息
-            _return_internal: 是否返回内部结果（用于 transcribe）
 
         Returns:
-            如果 _return_internal=True，返回 DecodeResult
-            否则返回 None（结果存储在 stream.result 中）
+            DecodeResult 对象，包含完整的解码结果和计时信息
         """
         if stream.audio_data is None:
             raise ValueError("Stream has no audio data. Call accept_waveform() first.")
@@ -501,58 +500,46 @@ class FunASREngine:
             raise RuntimeError("ASR engine not initialized. Call initialize() first.")
 
         try:
-            # 初始化 timings（如果需要返回内部结果）
-            timings = Timings() if _return_internal else None
+            # 初始化计时
+            timings = Timings()
 
             # 1. 音频编码
-            t_encode_start = time.perf_counter() if _return_internal else None
+            vprint("\n[2] 音频编码...", verbose)
+            t_encode_start = time.perf_counter()
             audio = stream.audio_data
 
-            if verbose and _return_internal:
-                print("\n[2] 音频编码...")
-
             audio_embd, enc_output = encode_audio(audio, self.encoder_sess)
-            if _return_internal and timings:
-                t_encode = time.perf_counter() - t_encode_start
-                timings.encode = t_encode
-                if verbose:
-                    print(f"    耗时: {t_encode*1000:.2f}ms")
+            t_encode = time.perf_counter() - t_encode_start
+            timings.encode = t_encode
+            vprint(f"    耗时: {t_encode*1000:.2f}ms", verbose)
 
             # 2. CTC 解码
-            t_ctc_start = time.perf_counter() if _return_internal else None
-
-            if verbose and _return_internal:
-                print("\n[3] CTC 解码...")
+            vprint("\n[3] CTC 解码...", verbose)
+            t_ctc_start = time.perf_counter()
 
             ctc_results, hotwords = self._run_ctc_decode(enc_output)
-            if _return_internal and timings:
-                t_ctc = time.perf_counter() - t_ctc_start
-                timings.ctc = t_ctc
-                if verbose and ctc_results:
-                    ctc_text = ''.join([r.text for r in ctc_results])
-                    print(f"    CTC: {ctc_text}")
-                    if hotwords:
-                        print(f"    热词: {hotwords}")
-                if verbose:
-                    print(f"    耗时: {t_ctc*1000:.2f}ms")
+            t_ctc = time.perf_counter() - t_ctc_start
+            timings.ctc = t_ctc
+            
+            if verbose and ctc_results:
+                ctc_text = ''.join([r.text for r in ctc_results])
+                vprint(f"    CTC: {ctc_text}", verbose)
+                if hotwords:
+                    vprint(f"    热词: {hotwords}", verbose)
+            vprint(f"    耗时: {t_ctc*1000:.2f}ms", verbose)
 
             # 3. 准备 Prompt
-            t_prepare_start = time.perf_counter() if _return_internal else None
-
-            if verbose and _return_internal:
-                print("\n[4] 准备 Prompt...")
+            vprint("\n[4] 准备 Prompt...", verbose)
+            t_prepare_start = time.perf_counter()
 
             prefix_embd, suffix_embd, n_prefix, n_suffix = self._prepare_prompt(hotwords, language, context)
-            if _return_internal and timings:
-                timings.prepare = time.perf_counter() - t_prepare_start
-                if verbose:
-                    print(f"    Prefix: {n_prefix} tokens")
-                    print(f"    Suffix: {n_suffix} tokens")
+            timings.prepare = time.perf_counter() - t_prepare_start
+            vprint(f"    Prefix: {n_prefix} tokens", verbose)
+            vprint(f"    Suffix: {n_suffix} tokens", verbose)
 
             # 4. LLM 解码
-            if verbose and _return_internal:
-                print("\n[5] LLM 解码...")
-                print("=" * 70)
+            vprint("\n[5] LLM 解码...", verbose)
+            vprint("=" * 70, verbose)
 
             full_embd = np.concatenate([
                 prefix_embd,
@@ -566,21 +553,17 @@ class FunASREngine:
             )
             text = text.strip()
 
-            if _return_internal and timings:
-                timings.inject = t_inject
-                timings.llm_generate = t_gen
+            timings.inject = t_inject
+            timings.llm_generate = t_gen
 
-            if verbose and _return_internal:
-                print("\n" + "=" * 70)
+            vprint("\n" + "=" * 70, verbose)
 
             # 5. 时间戳对齐
-            t_align_start = time.perf_counter() if _return_internal else None
+            vprint("\n[6] 时间戳对齐", verbose)
+            t_align_start = time.perf_counter()
             timestamps = []
             tokens = []
             aligned = None
-
-            if verbose and _return_internal:
-                print("\n[6] 时间戳对齐")
 
             if ctc_results:
                 aligned = align_timestamps(ctc_results, text)
@@ -588,45 +571,43 @@ class FunASREngine:
                     tokens = [seg['char'] for seg in aligned]
                     timestamps = [seg['start'] for seg in aligned]
 
-                    if verbose and _return_internal:
-                        print(f"    对齐耗时: {(time.perf_counter() - t_align_start)*1000:.2f}ms")
-                        print(f"    对齐结果 (前10个字符):")
-                        for r in aligned[:10]:
-                            print(f"      {r['start']:.2f}s: {r['char']}")
-                        if len(aligned) > 10:
-                            print("      ...")
+                    vprint(f"    对齐耗时: {(time.perf_counter() - t_align_start)*1000:.2f}ms", verbose)
+                    vprint(f"    对齐结果 (前10个字符):", verbose)
+                    for r in aligned[:10]:
+                        vprint(f"      {r['start']:.2f}s: {r['char']}", verbose)
+                    if len(aligned) > 10:
+                        vprint("      ...", verbose)
 
-            if _return_internal and timings:
-                timings.align = time.perf_counter() - t_align_start
+            timings.align = time.perf_counter() - t_align_start
 
-            # 6. 设置结果到 stream
+            # 6. 设置结果到 stream（兼容 sherpa-onnx API）
             stream.set_result(
                 text=text,
                 timestamps=timestamps,
                 tokens=tokens
             )
 
-            # 返回内部结果（供 transcribe 使用）
-            if _return_internal:
-                return DecodeResult(
-                    text=text,
-                    ctc_results=ctc_results,
-                    aligned=aligned,
-                    audio_embd=audio_embd,
-                    n_prefix=n_prefix,
-                    n_suffix=n_suffix,
-                    n_gen=n_gen,
-                    timings=timings,
-                    hotwords=hotwords
-                )
+            # 返回完整结果
+            return DecodeResult(
+                text=text,
+                ctc_results=ctc_results,
+                aligned=aligned,
+                audio_embd=audio_embd,
+                n_prefix=n_prefix,
+                n_suffix=n_suffix,
+                n_gen=n_gen,
+                timings=timings,
+                hotwords=hotwords
+            )
 
         except Exception as e:
-            if verbose:
-                self._log(f"✗ 解码失败: {e}", True)
+            vprint(f"✗ 解码失败: {e}", verbose)
             raise
 
     def cleanup(self):
         """清理资源"""
+        if self.hotword_manager:
+            self.hotword_manager.stop_file_watcher()
         if self.ctx:
             nano_llama.llama_free(self.ctx)
             self.ctx = None
@@ -634,7 +615,7 @@ class FunASREngine:
             nano_llama.llama_model_free(self.model)
             nano_llama.llama_backend_free()
             self._initialized = False
-            self._log("[ASR] 资源已释放", True)
+            print("[ASR] 资源已释放")
 
 
 def create_asr_engine(
@@ -668,7 +649,6 @@ def create_asr_engine(
         tokens_path=tokens_path,
         hotwords_path=hotwords_path,
         enable_ctc=enable_ctc,
-        quiet_mode=not verbose,
     )
 
     if not engine.initialize(verbose=verbose):

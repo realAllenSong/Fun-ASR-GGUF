@@ -129,7 +129,6 @@ class ASREngineConfig:
         n_threads: 线程数（None 表示自动）
         n_threads_batch: 批处理线程数（None 表示自动）
         n_ubatch: llama.cpp 内部物理 batch 大小
-        quiet_mode: 静默模式
         sample_rate: 音频采样率
     """
     encoder_onnx_path: str
@@ -142,7 +141,6 @@ class ASREngineConfig:
     n_threads: Optional[int] = None
     n_threads_batch: Optional[int] = None
     n_ubatch: int = 512
-    quiet_mode: bool = True
     sample_rate: int = 16000
 
 

@@ -6,6 +6,9 @@ numpy
 pydub 
 gguf
 
+rich
+watchdog
+
 # ==================== 模型导出依赖 ====================
 
 torch 

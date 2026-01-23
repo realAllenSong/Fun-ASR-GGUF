@@ -14,13 +14,7 @@ from collections import defaultdict
 import time
 import logging
 
-
-try:
-    from . import logger
-except ImportError:
-    import logging
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    logger = logging.getLogger('hotword')
+from . import logger
 
 
 # 尝试导入 Numba

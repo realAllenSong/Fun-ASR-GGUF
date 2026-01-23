@@ -1,3 +1,11 @@
-Claude Code
+# 热词文件单行一个
+
 睡前消息
-督工
+督公
+
+Claude
+Claude Code
+Fun-ASR-Nano
+
+CapsWriter
+CapsWriter-Offline

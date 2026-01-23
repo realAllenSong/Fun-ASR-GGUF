@@ -10,21 +10,9 @@
 """
 
 import logging
-import sys
 
-# ----------------------------------------------------------------------
-# 统一日志配置
-# ----------------------------------------------------------------------
-
-logger = logging.getLogger("hotword")
-logger.setLevel(logging.WARNING)  # 改为 WARNING，关闭 INFO 日志
-
-if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.WARNING)  # 改为 WARNING
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+# 使用主模块的 logger
+logger = logging.getLogger("fun_asr_gguf.hotword")
 
 from .hot_phoneme import PhonemeCorrector, CorrectionResult
 from .hot_rule import RuleCorrector

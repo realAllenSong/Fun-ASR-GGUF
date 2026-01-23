@@ -17,11 +17,7 @@ import logging
 
 from .algo_calc import find_best_match
 from .algo_phoneme import get_phoneme_info, Phoneme
-
-try:
-    from . import logger
-except ImportError:
-    logger = logging.getLogger(__name__)
+from . import logger
 
 
 class AccuRAG:

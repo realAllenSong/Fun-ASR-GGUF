@@ -73,15 +73,14 @@ def main():
         verbose=verbose,
     )
 
-    # 转录音频
+    print(f'\n预跑一遍，分配内存......\n')
     result = engine.transcribe(
         audio_file, 
         language=language, 
         context=context, 
-        verbose=verbose
+        verbose=False
     )
 
-    input('回车继续')
     result = engine.transcribe(
         audio_file, 
         language=language, 

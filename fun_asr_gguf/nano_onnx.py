@@ -26,9 +26,6 @@ def load_onnx_models(encoder_path, ctc_path):
     )
     
     t_cost = time.perf_counter() - t_start
-    print(f"    Encoder: {os.path.basename(encoder_path)}")
-    print(f"    CTC Head: {os.path.basename(ctc_path)}")
-    print(f"    ONNX Models Loaded in {t_cost:.2f}s")
     
     return encoder_sess, ctc_sess, t_cost
 
