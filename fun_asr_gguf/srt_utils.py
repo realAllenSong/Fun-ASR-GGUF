@@ -25,8 +25,8 @@ def generate_srt_file(
 
     subtitles = []
     
-    # 标点符号分句参考
-    puncs = set("，。！？；, .!?;")
+    # 标点符号分句参考 (移除空格，避免英文按单词分行)
+    puncs = set("，。！？；,.!?;")
     
     current_chars = []
     start_time = segments[0]['start']
@@ -39,14 +39,13 @@ def generate_srt_file(
         
         # 判断是否需要切分：
         # 1. 遇到标点
-        # 2. 达到最大长度
-        # 3. 最后一个字符
+        # 2. 最后一个字符
+        # (用户要求忽略长度限制，仅按标点换行)
         is_punc = char in puncs
         is_last = (i == len(segments) - 1)
-        too_long = len(current_chars) >= max_chars_per_line
         
-        if is_punc or is_last or too_long:
-            end_time = time_s + 0.5 # 默认标点/结尾给 0.5s 停顿展示
+        if is_punc or is_last:
+            end_time = time_s + 0.1 # 默认标点/结尾给 0.1s 停顿展示
             # 如果下一条已经开始了，则以前面为准
             if not is_last and segments[i+1]['start'] < end_time:
                 end_time = segments[i+1]['start']
