@@ -79,6 +79,11 @@ class llama_context_params(ctypes.Structure):
         ("n_samplers", ctypes.c_size_t),
     ]
 
+class llama_sampler_chain_params(ctypes.Structure):
+    _fields_ = [
+        ("no_perf", ctypes.c_bool),
+    ]
+
 class llama_batch(ctypes.Structure):
     _fields_ = [
         ("n_tokens", ctypes.c_int32),
@@ -122,6 +127,18 @@ llama_get_memory = None
 llama_memory_clear = None
 llama_model_n_embd = None
 
+# Sampler
+llama_sampler_chain_default_params = None
+llama_sampler_chain_init = None
+llama_sampler_chain_add = None
+llama_sampler_init_greedy = None
+llama_sampler_init_dist = None
+llama_sampler_init_temp = None
+llama_sampler_init_top_k = None
+llama_sampler_init_top_p = None
+llama_sampler_sample = None
+llama_sampler_free = None
+
 def init_llama_lib():
     """初始化 llama.cpp 库，支持跨平台加载"""
     global llama, ggml, ggml_base
@@ -132,6 +149,9 @@ def init_llama_lib():
     global llama_decode, llama_get_logits, llama_tokenize
     global llama_get_memory, llama_memory_clear, llama_model_n_embd
     global llama_vocab_n_tokens, llama_vocab_eos, llama_token_to_piece
+    global llama_sampler_chain_default_params, llama_sampler_chain_init, llama_sampler_chain_add
+    global llama_sampler_init_greedy, llama_sampler_init_dist, llama_sampler_init_temp
+    global llama_sampler_init_top_k, llama_sampler_init_top_p, llama_sampler_sample, llama_sampler_free
     global _log_callback_ref
 
     if llama is not None:
@@ -277,6 +297,51 @@ def init_llama_lib():
     llama_memory_clear.argtypes = [ctypes.c_void_p, ctypes.c_bool]
     llama_memory_clear.restype = None
 
+    # Sampler
+    try:
+        llama_sampler_chain_default_params = llama.llama_sampler_chain_default_params
+        llama_sampler_chain_default_params.argtypes = []
+        llama_sampler_chain_default_params.restype = llama_sampler_chain_params
+
+        llama_sampler_chain_init = llama.llama_sampler_chain_init
+        llama_sampler_chain_init.argtypes = [llama_sampler_chain_params]
+        llama_sampler_chain_init.restype = ctypes.c_void_p
+
+        llama_sampler_chain_add = llama.llama_sampler_chain_add
+        llama_sampler_chain_add.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        llama_sampler_chain_add.restype = None
+
+        llama_sampler_init_greedy = llama.llama_sampler_init_greedy
+        llama_sampler_init_greedy.argtypes = []
+        llama_sampler_init_greedy.restype = ctypes.c_void_p
+
+        llama_sampler_init_dist = llama.llama_sampler_init_dist
+        llama_sampler_init_dist.argtypes = [ctypes.c_uint32]
+        llama_sampler_init_dist.restype = ctypes.c_void_p
+
+        llama_sampler_init_temp = llama.llama_sampler_init_temp
+        llama_sampler_init_temp.argtypes = [ctypes.c_float]
+        llama_sampler_init_temp.restype = ctypes.c_void_p
+
+        llama_sampler_init_top_k = llama.llama_sampler_init_top_k
+        llama_sampler_init_top_k.argtypes = [ctypes.c_int32]
+        llama_sampler_init_top_k.restype = ctypes.c_void_p
+
+        llama_sampler_init_top_p = llama.llama_sampler_init_top_p
+        llama_sampler_init_top_p.argtypes = [ctypes.c_float, ctypes.c_size_t]
+        llama_sampler_init_top_p.restype = ctypes.c_void_p
+
+        llama_sampler_sample = llama.llama_sampler_sample
+        llama_sampler_sample.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+        llama_sampler_sample.restype = llama_token
+
+        llama_sampler_free = llama.llama_sampler_free
+        llama_sampler_free.argtypes = [ctypes.c_void_p]
+        llama_sampler_free.restype = None
+    except AttributeError:
+        # 版本较旧的 llama.cpp 可能没有这些导出
+        logger.warning("llama.cpp 库中缺少原生采样 API，将无法使用原生采样优化。")
+
 def load_model(model_path: str, n_gpu_layers: int = -1):
     """加载 GGUF 模型（包含环境优化和错误排查日志）"""
     init_llama_lib()
@@ -340,6 +405,40 @@ def create_context(model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1,
 def create_batch(n_tokens, embd_dim=0, n_seq_max=1):
     """创建推理用的 Batch"""
     return llama_batch_init(n_tokens, embd_dim, n_seq_max)
+
+class LlamaSampler:
+    """采样器的面向对象封装"""
+    def __init__(self, ptr):
+        self.ptr = ptr
+
+    def sample(self, ctx, idx=-1):
+        """采样一个 Token"""
+        return llama_sampler_sample(self.ptr, ctx, idx)
+
+    def free(self):
+        """释放采样器资源"""
+        if self.ptr:
+            llama_sampler_free(self.ptr)
+            self.ptr = None
+
+def create_sampler(temperature=0.8, top_k=50, top_p=1.0, seed=None):
+    """创建 ASR 专用的采样器对象"""
+    import time
+    if seed is None:
+        seed = int(time.time())
+        
+    sparams = llama_sampler_chain_default_params()
+    smpl_ptr = llama_sampler_chain_init(sparams)
+    
+    if temperature > 0:
+        llama_sampler_chain_add(smpl_ptr, llama_sampler_init_top_k(top_k))
+        llama_sampler_chain_add(smpl_ptr, llama_sampler_init_top_p(top_p, 1))
+        llama_sampler_chain_add(smpl_ptr, llama_sampler_init_temp(temperature))
+        llama_sampler_chain_add(smpl_ptr, llama_sampler_init_dist(seed))
+    else:
+        llama_sampler_chain_add(smpl_ptr, llama_sampler_init_greedy())
+        
+    return LlamaSampler(smpl_ptr)
 
 # =========================================================================
 # 日志回调

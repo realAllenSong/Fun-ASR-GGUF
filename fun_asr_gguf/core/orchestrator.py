@@ -27,7 +27,10 @@ class TranscriptionOrchestrator:
         overlap: float = 2.0,
         start_second: Optional[float] = None,
         duration: Optional[float] = None,
-        srt: bool = False
+        srt: bool = False,
+        temperature: float = 0.3,
+        top_p: float = 1.0,
+        top_k: int = 50
     ) -> TranscriptionResult:
         
         result = TranscriptionResult()
@@ -55,9 +58,11 @@ class TranscriptionOrchestrator:
 
                 # 2. Strategy Selection
                 if audio_duration <= segment_size + 2.0:
-                    self._transcribe_short(audio, result, language, context, verbose, reporter, base_offset)
+                    self._transcribe_short(audio, result, language, context, verbose, reporter, base_offset,
+                                           temperature=temperature, top_p=top_p, top_k=top_k)
                 else:
-                    self._transcribe_long(audio, result, language, context, verbose, segment_size, overlap, reporter, base_offset)
+                    self._transcribe_long(audio, result, language, context, verbose, segment_size, overlap, reporter, base_offset,
+                                          temperature=temperature, top_p=top_p, top_k=top_k)
 
                 result.timings.total = time.perf_counter() - t_start
                 self._print_stats(reporter, result)
@@ -80,11 +85,13 @@ class TranscriptionOrchestrator:
                 reporter.print(f"\n✗ 转录失败: {e}", force=True)
                 raise
 
-    def _transcribe_short(self, audio, result, language, context, verbose, reporter, base_offset):
+    def _transcribe_short(self, audio, result, language, context, verbose, reporter, base_offset,
+                          temperature=0.8, top_p=1.0, top_k=50):
         stream = RecognitionStream()
         stream.accept_waveform(self.models.config.sample_rate, audio)
         
-        d_res = self.decoder.decode_stream(stream, language, context, verbose, reporter)
+        d_res = self.decoder.decode_stream(stream, language, context, verbose, reporter,
+                                           temperature=temperature, top_p=top_p, top_k=top_k)
         
         # Sync stats
         for field in ['encode', 'ctc', 'prepare', 'inject', 'llm_generate', 'align']:
@@ -102,7 +109,8 @@ class TranscriptionOrchestrator:
         if verbose:
             self._print_performance_stats(reporter, d_res, audio, result.timings.inject, result.timings.llm_generate)
 
-    def _transcribe_long(self, audio, result, language, context, verbose, segment_size, overlap, reporter, base_offset):
+    def _transcribe_long(self, audio, result, language, context, verbose, segment_size, overlap, reporter, base_offset,
+                         temperature=0.8, top_p=1.0, top_k=50):
         reporter.print(f"    检测到长音频，开启分段识别模式...", force=True)
         reporter.skip_technical = True
         
@@ -126,7 +134,8 @@ class TranscriptionOrchestrator:
             stream.accept_waveform(self.models.config.sample_rate, chunk)
             
             # Sub-segment always uses verbose=True for tokens, but reporter will filter tech logs
-            d_res = self.decoder.decode_stream(stream, language, context, True, reporter)
+            d_res = self.decoder.decode_stream(stream, language, context, True, reporter,
+                                               temperature=temperature, top_p=top_p, top_k=top_k)
             
             segment_results.append({
                 'text': d_res.text,

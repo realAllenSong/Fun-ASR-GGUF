@@ -45,7 +45,10 @@ class LLMDecoder:
         n_input_tokens: int,
         n_predict: int,
         stream_output: bool = False,
-        reporter: Optional[DisplayReporter] = None
+        reporter: Optional[DisplayReporter] = None,
+        temperature: float = 0.3,
+        top_p: float = 1.0,
+        top_k: int = 50
     ) -> Tuple[str, int, float, float]:
         
         t_inject_start = time.perf_counter()
@@ -84,11 +87,11 @@ class LLMDecoder:
         current_pos = n_input_tokens
         decoder_utf8 = llama.ByteDecoder()
         tokens_generated = 0
+        smpl = llama.create_sampler(temperature=temperature, top_k=top_k, top_p=top_p)
 
         for _ in range(n_predict):
-            logits_ptr = llama.llama_get_logits(self.models.ctx)
-            logits_arr = np.ctypeslib.as_array(logits_ptr, shape=(vocab_size,))
-            token_id = int(np.argmax(logits_arr))
+            # 使用面向对象接口采样
+            token_id = smpl.sample(self.models.ctx, -1)
 
             if token_id == self.models.eos_token or token_id in self.stop_tokens:
                 break
@@ -111,6 +114,8 @@ class LLMDecoder:
             if llama.llama_decode(self.models.ctx, batch_text) != 0: break
             current_pos += 1
 
+        smpl.free()
+        
         remaining = decoder_utf8.flush()
         generated_text += remaining
         if stream_output and remaining:
@@ -135,7 +140,10 @@ class StreamDecoder:
         language: Optional[str] = None,
         context: Optional[str] = None,
         verbose: bool = True,
-        reporter: Optional[DisplayReporter] = None
+        reporter: Optional[DisplayReporter] = None,
+        temperature: float = 0.3,
+        top_p: float = 1.0,
+        top_k: int = 50
     ) -> DecodeResult:
         
         timings = Timings()
@@ -184,7 +192,8 @@ class StreamDecoder:
         full_embd = np.concatenate([p_embd, audio_embd.astype(np.float32), s_embd], axis=0)
         text, n_gen, t_inj, t_gen = self.llm_decoder.decode(
             full_embd, full_embd.shape[0], self.models.config.n_predict, 
-            stream_output=verbose, reporter=reporter
+            stream_output=verbose, reporter=reporter,
+            temperature=temperature, top_p=top_p, top_k=top_k
         )
         text = text.strip()
         timings.inject = t_inj

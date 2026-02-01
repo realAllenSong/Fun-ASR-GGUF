@@ -61,7 +61,10 @@ class FunASREngine:
         overlap: float = 2.0,
         start_second: Optional[float] = None,
         duration: Optional[float] = None,
-        srt: bool = False
+        srt: bool = False,
+        temperature: float = 0.3,
+        top_p: float = 1.0,
+        top_k: int = 50
     ) -> TranscriptionResult:
         """转录音频文件 (委托给 Orchestrator)"""
         return self.orchestrator.transcribe(
@@ -73,7 +76,10 @@ class FunASREngine:
             overlap=overlap,
             start_second=start_second,
             duration=duration,
-            srt=srt
+            srt=srt,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k
         )
 
     def create_stream(self, hotwords: Optional[str] = None) -> RecognitionStream:
@@ -87,11 +93,15 @@ class FunASREngine:
         language: Optional[str] = None,
         context: Optional[str] = None,
         verbose: bool = True,
-        reporter = None
+        reporter = None,
+        temperature: float = 0.3,
+        top_p: float = 1.0,
+        top_k: int = 50
     ) -> DecodeResult:
         """解码识别流 (委托给 Orchestrator 内置的 Decoder)"""
         return self.orchestrator.decoder.decode_stream(
-            stream, language, context, verbose, reporter
+            stream, language, context, verbose, reporter,
+            temperature=temperature, top_p=top_p, top_k=top_k
         )
 
     def cleanup(self):
