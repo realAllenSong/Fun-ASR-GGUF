@@ -271,7 +271,7 @@ class EncoderExportWrapperPaddable(nn.Module):
         valid_samples = ilens[0]
         batch, _, samples = audio.shape
         audio_indices = torch.ones_like(audio, dtype=torch.long).cumsum(-1) - 1
-        audio_mask = (audio_indices < valid_samples)
+        audio_mask = (audio_indices < valid_samples).type(audio.dtype)
 
         # 1. Normalization
         sum_val = (audio * audio_mask).sum()
@@ -307,8 +307,7 @@ class EncoderExportWrapperPaddable(nn.Module):
             lfr_list.append(feat[:, :T_lfr_phys, :])
         x = torch.cat(lfr_list, dim=-1)
         
-        # 4. Masking & Model
-        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid)
+        m = (torch.arange(T_lfr_phys, device=x.device).unsqueeze(0) < T_lfr_valid).type(audio.dtype)
         x = x * m.unsqueeze(-1)
         
         enc = self.hybrid_model.audio_encoder(x, m)
